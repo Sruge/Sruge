@@ -46,6 +46,7 @@ body.locked #reticle span { inset: 15px; background: var(--magenta); }
 body.locked #reticle::before, body.locked #reticle::after { background: rgba(255, 64, 200, 0.6); }
 
 .glabel {
+  pointer-events: none;
   font: 12px 'JetBrains Mono', monospace; letter-spacing: 0.05em; text-transform: uppercase;
   padding: 4px 8px; background: var(--glass); border: 1px solid var(--line); border-radius: 4px; color: var(--cyan);
 }
@@ -141,3 +142,5 @@ body.locked .eyebrow { color: var(--magenta); }
   .filters, .credit { padding-left: 16px; padding-right: 16px; }
   #panel h1 { font-size: 17px; }
 }
+
+#hover-label { position: fixed; left: 0; top: 0; z-index: 4; }

@@ -1,14 +1,14 @@
 import Globe from 'globe.gl';
-import { Color, MeshPhongMaterial } from 'three';
+import { BufferGeometry, Color, Float32BufferAttribute, LineBasicMaterial, LineSegments, MeshPhongMaterial } from 'three';
 import './style.css';
-import { COUNTRIES, COUNTRIES_COARSE, HEX_RES, countryAt, reverseGeocode, type Country } from './geo';
+import { BORDERS, COUNTRIES, COUNTRIES_COARSE, HEX_RES, countryAt, reverseGeocode, type Country } from './geo';
 import { TOPICS } from './topics';
 import { fetchGdelt, fetchGuardian, gdeltQueryString, GUARDIAN_KEY, SupersededError, type Article, type NewsQuery } from './news';
 
 /** Below this camera altitude (in globe radii) a region is "locked" and its news loads. */
 const LOCK_ALT = 1.6;
 /** Below this altitude we refine from country to city/region. */
-const CITY_ALT = 0.45;
+const CITY_ALT = 0.15;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const ui = {
@@ -30,6 +30,7 @@ const ui = {
   search: $<HTMLFormElement>('search'),
   searchInput: $<HTMLInputElement>('search-input'),
   countryList: $<HTMLDataListElement>('country-list'),
+  hoverLabel: $('hover-label'),
 };
 
 interface Target {
@@ -50,6 +51,14 @@ const state = {
 
 // ---------------------------------------------------------------- globe ---
 const CYAN = '63, 245, 255';
+const MAGENTA = '255, 64, 200';
+
+/** Only the hovered and the locked country are real polygons; everything else is one merged border mesh. */
+function highlighted(): Country[] {
+  return [...new Set([state.hovered, state.target?.country].filter((c): c is Country => !!c))];
+}
+const isTarget = (d: object) => d === state.target?.country;
+
 const globe = new Globe(ui.globe, { animateIn: true })
   .backgroundColor('rgba(0,0,0,0)')
   .showAtmosphere(true)
@@ -60,40 +69,49 @@ const globe = new Globe(ui.globe, { animateIn: true })
   .hexPolygonsData(COUNTRIES_COARSE)
   .hexPolygonResolution(HEX_RES)
   .hexPolygonMargin(0.4)
-  .hexPolygonAltitude(0.008)
+  .hexPolygonAltitude(0.006)
   .hexPolygonColor(() => `rgba(${CYAN}, 0.55)`)
-  // Country outlines for borders, hover and selection.
-  .polygonsData(COUNTRIES)
-  .polygonAltitude((d) => (d === state.target?.country ? 0.014 : d === state.hovered ? 0.011 : 0.004))
-  .polygonCapColor((d) =>
-    d === state.target?.country ? 'rgba(255, 64, 200, 0.22)' : d === state.hovered ? `rgba(${CYAN}, 0.16)` : 'rgba(0,0,0,0)',
-  )
-  .polygonSideColor(() => `rgba(${CYAN}, 0.05)`)
-  .polygonStrokeColor((d) => (d === state.target?.country ? 'rgba(255, 64, 200, 0.9)' : `rgba(${CYAN}, 0.35)`))
-  .polygonLabel((d) => `<div class="glabel">${escapeHtml((d as Country).properties.name)}</div>`)
-  .polygonsTransitionDuration(200)
-  .onPolygonHover((d) => {
-    state.hovered = (d as Country) ?? null;
-    refreshPolygons();
-  })
-  .onPolygonClick((d) => {
-    const c = d as Country;
-    const [lng, lat] = c.properties.centroid;
-    flyTo(lat, lng, 1.0);
-  })
+  .polygonsData([])
+  .polygonAltitude((d) => (isTarget(d) ? 0.012 : 0.009))
+  .polygonCapColor((d) => (isTarget(d) ? `rgba(${MAGENTA}, 0.22)` : `rgba(${CYAN}, 0.14)`))
+  .polygonSideColor(() => 'rgba(0,0,0,0)')
+  .polygonStrokeColor((d) => (isTarget(d) ? `rgba(${MAGENTA}, 0.95)` : `rgba(${CYAN}, 0.8)`))
+  .polygonCapCurvatureResolution(3)
+  .polygonsTransitionDuration(0)
+  .onGlobeClick(({ lat, lng }) => onPick(lat, lng))
+  .onPolygonClick((_d, _e, { lat, lng }) => onPick(lat, lng))
   // Pulsing scan rings on the locked target.
   .ringsData([])
-  .ringColor(() => (t: number) => `rgba(255, 64, 200, ${1 - t})`)
+  .ringColor(() => (t: number) => `rgba(${MAGENTA}, ${1 - t})`)
   .ringMaxRadius(5)
   .ringPropagationSpeed(2.5)
   .ringRepeatPeriod(1100)
   .pointOfView({ lat: 25, lng: 10, altitude: 2.6 });
+
+// Never render more pixels than needed; high-DPI phones otherwise draw 9× the pixels.
+globe.renderer().setPixelRatio(Math.min(devicePixelRatio, 1.5));
 
 const mat = globe.globeMaterial() as MeshPhongMaterial;
 mat.color = new Color('#03101f');
 mat.emissive = new Color('#021a2e');
 mat.emissiveIntensity = 0.6;
 mat.shininess = 12;
+
+// All borders and coastlines in a single draw call.
+{
+  const pos: number[] = [];
+  for (const line of BORDERS.coordinates) {
+    for (let i = 1; i < line.length; i++) {
+      for (const [lng, lat] of [line[i - 1], line[i]]) {
+        const { x, y, z } = globe.getCoords(lat, lng, 0.007);
+        pos.push(x, y, z);
+      }
+    }
+  }
+  const geom = new BufferGeometry();
+  geom.setAttribute('position', new Float32BufferAttribute(pos, 3));
+  globe.scene().add(new LineSegments(geom, new LineBasicMaterial({ color: `rgb(${CYAN})`, transparent: true, opacity: 0.35 })));
+}
 
 const controls = globe.controls();
 controls.autoRotate = true;
@@ -104,12 +122,43 @@ ui.globe.addEventListener('pointerdown', () => (controls.autoRotate = false), { 
 ui.globe.addEventListener('wheel', () => (controls.autoRotate = false), { once: true, passive: true });
 
 function refreshPolygons() {
-  // Re-assigning accessors makes globe.gl re-evaluate them.
-  globe
-    .polygonAltitude(globe.polygonAltitude())
-    .polygonCapColor(globe.polygonCapColor())
-    .polygonStrokeColor(globe.polygonStrokeColor());
+  globe.polygonsData(highlighted());
 }
+
+function onPick(lat: number, lng: number) {
+  const c = countryAt(lat, lng);
+  if (!c) return;
+  const [clng, clat] = c.properties.centroid;
+  flyTo(clat, clng, Math.min(1.0, globe.pointOfView().altitude));
+}
+
+// Hover: hit-test the pointer against country shapes (cheap with bounding boxes) instead of
+// raycasting hundreds of meshes.
+let hoverFrame = 0;
+ui.globe.addEventListener('pointermove', (e) => {
+  if (e.pointerType !== 'mouse' || e.buttons) return;
+  cancelAnimationFrame(hoverFrame);
+  hoverFrame = requestAnimationFrame(() => {
+    const r = ui.globe.getBoundingClientRect();
+    const p = globe.toGlobeCoords(e.clientX - r.left, e.clientY - r.top);
+    const c = p ? countryAt(p.lat, p.lng, false) : null;
+    if (c) {
+      ui.hoverLabel.textContent = c.properties.name;
+      ui.hoverLabel.style.transform = `translate(${e.clientX + 14}px, ${e.clientY + 14}px)`;
+    }
+    ui.hoverLabel.hidden = !c;
+    ui.globe.style.cursor = c ? 'pointer' : '';
+    if (c !== state.hovered) {
+      state.hovered = c;
+      refreshPolygons();
+    }
+  });
+});
+ui.globe.addEventListener('pointerleave', () => {
+  ui.hoverLabel.hidden = true;
+  state.hovered = null;
+  refreshPolygons();
+});
 
 function flyTo(lat: number, lng: number, altitude: number) {
   controls.autoRotate = false;
@@ -218,9 +267,24 @@ async function loadNews() {
   ui.articles.innerHTML = '<li class="skeleton"></li>'.repeat(5);
 
   try {
-    const articles = source === 'guardian' ? await fetchGuardian(q) : await fetchGdelt(q);
+    const onStatus = (m: string) => key === state.lastKey && (ui.status.textContent = m);
+    const slowHint = setTimeout(() => onStatus('Scanning news feeds… GDELT can take 10–20 s'), 4000);
+    const articles = await (source === 'guardian' ? fetchGuardian(q) : fetchGdelt(q, onStatus)).finally(() =>
+      clearTimeout(slowHint),
+    );
     if (key !== state.lastKey) return;
     renderArticles(articles);
+    if (t.kind === 'CITY / REGION' && t.country && articles.length < 10) {
+      const c = t.country;
+      ui.articles.insertAdjacentHTML(
+        'beforeend',
+        `<li class="empty"><button class="retry widen">Show all news about ${escapeHtml(c.properties.name)}</button></li>`,
+      );
+      ui.articles.querySelector('.widen')?.addEventListener('click', () => {
+        const [lng, lat] = c.properties.centroid;
+        flyTo(lat, lng, 1.0);
+      });
+    }
     ui.status.textContent = `${articles.length} article${articles.length === 1 ? '' : 's'} · ${q.topic.label} · ${ui.timespan.selectedOptions[0].text}`;
     ui.status.title = source === 'gdelt' ? `GDELT query: ${gdeltQueryString(q)}` : '';
   } catch (e) {
@@ -234,7 +298,7 @@ async function loadNews() {
 
 function renderArticles(list: Article[]) {
   if (!list.length) {
-    ui.articles.innerHTML = '<li class="empty">No recent coverage found. Try another topic or a wider time window.</li>';
+    ui.articles.innerHTML = '<li class="empty">No recent coverage found. Try another topic, a wider time window, or turn off “English only”.</li>';
     return;
   }
   ui.articles.innerHTML = list

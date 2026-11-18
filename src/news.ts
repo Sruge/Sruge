@@ -31,31 +31,75 @@ export class SupersededError extends Error {
 const clean = (s: string) => s.replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s+/g, ' ').trim();
 
 // ---------------------------------------------------------------------------
-// GDELT DOC 2.0 — free, keyless, global, ~15 min latency, 65+ languages.
+// GDELT DOC 2.0 — free, keyless, global, 65+ languages.
 // Docs: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
-// GDELT asks clients to send at most one request every 5 seconds, so requests go
-// through a single "latest wins" slot: a newer request replaces one still waiting.
+// In practice responses take 5–20 s and GDELT answers "429 Too Many Requests" whenever an IP
+// sends more than one request per 5 s. Its 429 responses carry no CORS header, so the browser
+// only sees a generic network error. Hence: one request at a time, a gap after each, automatic
+// retries with backoff, and a cache that survives reloads.
 // ---------------------------------------------------------------------------
-const GDELT_GAP_MS = 5500;
-let lastGdeltAt = 0;
+const GDELT_GAP_MS = 6000;
+const GDELT_TIMEOUT_MS = 45000;
+const RETRY_DELAYS_MS = [7000, 15000];
+let gdeltFreeAt = 0;
 let pending: { run: () => void; reject: (e: Error) => void } | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
-const cache = new Map<string, { at: number; data: Article[] }>();
-const CACHE_MS = 10 * 60 * 1000;
+let busy = false;
 
+/** Runs tasks strictly one at a time with a gap in between; a newer task replaces a waiting one. */
 function schedule<T>(task: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     pending?.reject(new SupersededError());
     pending = { run: () => task().then(resolve, reject), reject };
-    clearTimeout(timer);
-    const wait = Math.max(0, lastGdeltAt + GDELT_GAP_MS - Date.now());
-    timer = setTimeout(() => {
-      const job = pending;
-      pending = null;
-      lastGdeltAt = Date.now();
-      job?.run();
-    }, wait);
+    pump();
   });
+}
+function pump() {
+  clearTimeout(timer);
+  if (busy || !pending) return;
+  const wait = Math.max(0, gdeltFreeAt - Date.now());
+  timer = setTimeout(() => {
+    const job = pending;
+    if (!job || busy) return;
+    pending = null;
+    busy = true;
+    job.run();
+  }, wait);
+}
+function release(extraWaitMs = 0) {
+  busy = false;
+  gdeltFreeAt = Date.now() + GDELT_GAP_MS + extraWaitMs;
+  pump();
+}
+
+// --- cache (memory + localStorage, 15 min) ---
+const CACHE_MS = 15 * 60 * 1000;
+const memCache = new Map<string, { at: number; data: Article[] }>();
+function cacheGet(url: string): Article[] | null {
+  let hit = memCache.get(url);
+  if (!hit) {
+    try {
+      const raw = localStorage.getItem('ng:' + url);
+      if (raw) {
+        const j = JSON.parse(raw);
+        hit = { at: j.at, data: j.data.map((a: any) => ({ ...a, published: a.published ? new Date(a.published) : null })) };
+        memCache.set(url, hit);
+      }
+    } catch {}
+  }
+  return hit && Date.now() - hit.at < CACHE_MS ? hit.data : null;
+}
+function cacheSet(url: string, data: Article[]) {
+  const entry = { at: Date.now(), data };
+  memCache.set(url, entry);
+  try {
+    // Drop stale entries so storage doesn't fill up.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k?.startsWith('ng:') && Date.now() - (JSON.parse(localStorage.getItem(k) ?? '{}').at ?? 0) > CACHE_MS) localStorage.removeItem(k);
+    }
+    localStorage.setItem('ng:' + url, JSON.stringify(entry));
+  } catch {}
 }
 
 export function gdeltQueryString(q: NewsQuery): string {
@@ -70,51 +114,88 @@ function parseGdeltDate(s?: string): Date | null {
   return m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6])) : null;
 }
 
-export async function fetchGdelt(q: NewsQuery): Promise<Article[]> {
-  const query = gdeltQueryString(q);
+class RetryableError extends Error {}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function gdeltOnce(url: string): Promise<Article[]> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), GDELT_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: ctrl.signal });
+  } catch (e) {
+    // A 429 without CORS headers, a timeout and a dropped connection all look like this.
+    throw new RetryableError(ctrl.signal.aborted ? 'GDELT timed out' : 'GDELT is busy (rate limited or unreachable)');
+  } finally {
+    clearTimeout(t);
+  }
+  const text = await res.text();
+  if (res.status === 429 || /limit requests/i.test(text)) throw new RetryableError('GDELT is busy (rate limited)');
+  if (!res.ok) throw new RetryableError(`GDELT responded ${res.status}`);
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // GDELT reports query problems as plain text; those won't improve on retry.
+    throw new Error(text.trim().slice(0, 200) || 'GDELT returned an empty response');
+  }
+  const seen = new Set<string>();
+  return (json.articles ?? [])
+    .filter((a: any) => {
+      // GDELT often lists the same story syndicated under identical titles.
+      const k = (a.title ?? '').toLowerCase();
+      if (!k || seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .map((a: any) => ({
+      title: a.title,
+      url: a.url,
+      source: a.domain,
+      published: parseGdeltDate(a.seendate),
+      image: a.socialimage || undefined,
+      language: a.language,
+      country: a.sourcecountry,
+    }));
+}
+
+export async function fetchGdelt(q: NewsQuery, onStatus?: (msg: string) => void): Promise<Article[]> {
   const params = new URLSearchParams({
-    query,
+    query: gdeltQueryString(q),
     mode: 'artlist',
     format: 'json',
-    maxrecords: '75',
+    maxrecords: '100',
     timespan: q.timespan,
     sort: q.sort,
   });
   const url = `https://api.gdeltproject.org/api/v2/doc/doc?${params}`;
-  const hit = cache.get(url);
-  if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
+  const hit = cacheGet(url);
+  if (hit) return hit;
 
   return schedule(async () => {
-    const res = await fetch(url);
-    const text = await res.text();
-    if (!res.ok) throw new Error(`GDELT responded ${res.status}`);
-    let json: any;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      // GDELT reports query problems (and rate limiting) as plain text.
-      throw new Error(text.trim().slice(0, 200) || 'GDELT returned an empty response');
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const data = await gdeltOnce(url);
+        cacheSet(url, data);
+        release();
+        return data;
+      } catch (e) {
+        const delay = RETRY_DELAYS_MS[attempt];
+        if (!(e instanceof RetryableError) || delay === undefined || pending) {
+          // Give up (or let a newer request go first).
+          release(e instanceof RetryableError ? 4000 : 0);
+          if (pending) throw new SupersededError();
+          throw e;
+        }
+        onStatus?.(`${(e as Error).message}. Retrying in ${delay / 1000} s…`);
+        await sleep(delay);
+        if (pending) {
+          release();
+          throw new SupersededError();
+        }
+        onStatus?.('Scanning news feeds…');
+      }
     }
-    const seen = new Set<string>();
-    const data: Article[] = (json.articles ?? [])
-      .filter((a: any) => {
-        // GDELT often lists the same story syndicated under identical titles.
-        const k = (a.title ?? '').toLowerCase();
-        if (!k || seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      })
-      .map((a: any) => ({
-        title: a.title,
-        url: a.url,
-        source: a.domain,
-        published: parseGdeltDate(a.seendate),
-        image: a.socialimage || undefined,
-        language: a.language,
-        country: a.sourcecountry,
-      }));
-    cache.set(url, { at: Date.now(), data });
-    return data;
   });
 }
 

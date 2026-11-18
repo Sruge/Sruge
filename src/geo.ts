@@ -1,6 +1,6 @@
-import { feature } from 'topojson-client';
-import { geoArea, geoCentroid, geoContains, geoDistance } from 'd3-geo';
-import type { Feature, FeatureCollection, Geometry, Polygon } from 'geojson';
+import { feature, mesh } from 'topojson-client';
+import { geoArea, geoBounds, geoCentroid, geoContains, geoDistance } from 'd3-geo';
+import type { Feature, FeatureCollection, Geometry, MultiLineString, Polygon } from 'geojson';
 import { polygonToCells } from 'h3-js';
 import countries50 from 'world-atlas/countries-50m.json';
 import countries110 from 'world-atlas/countries-110m.json';
@@ -10,6 +10,8 @@ export interface CountryProps {
   /** Name(s) to search for in news text. */
   aliases: string[];
   centroid: [number, number]; // [lng, lat]
+  /** [[west, south], [east, north]]; west > east when crossing the antimeridian. */
+  bounds: [[number, number], [number, number]];
 }
 export type Country = Feature<Geometry, CountryProps>;
 
@@ -64,6 +66,7 @@ function toCountries(topo: any): Country[] {
           name,
           aliases: ALIASES[name] ?? [name],
           centroid: mainCentroid(f),
+          bounds: geoBounds(f),
         },
       };
     });
@@ -91,11 +94,23 @@ export const COUNTRIES_COARSE = toCountries(countries110)
   .map((c) => (hexable(c) ? c : COUNTRIES.find((d) => d.properties.name === c.properties.name && hexable(d))))
   .filter((c): c is Country => !!c);
 
-/** Country under a point, or the nearest one within ~600 km (useful over coasts and small islands). */
-export function countryAt(lat: number, lng: number): Country | null {
+/** Every border and coastline as one multi-line, for a single-draw-call outline layer. */
+export const BORDERS = mesh(countries50 as any, (countries50 as any).objects.countries) as MultiLineString;
+
+function inBounds(c: Country, lng: number, lat: number) {
+  const [[w, s], [e, n]] = c.properties.bounds;
+  if (lat < s || lat > n) return false;
+  return w <= e ? lng >= w && lng <= e : lng >= w || lng <= e;
+}
+
+/**
+ * Country under a point. With `nearest`, falls back to the closest country within ~600 km
+ * (useful over coasts and small islands).
+ */
+export function countryAt(lat: number, lng: number, nearest = true): Country | null {
   const p: [number, number] = [lng, lat];
-  const hit = COUNTRIES.find((c) => geoContains(c, p));
-  if (hit) return hit;
+  const hit = COUNTRIES.find((c) => inBounds(c, lng, lat) && geoContains(c, p));
+  if (hit || !nearest) return hit ?? null;
   let best: Country | null = null;
   let bestD = Infinity;
   for (const c of COUNTRIES) {
