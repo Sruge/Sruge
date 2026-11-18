@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NewsGlobe</title>
+    <meta name="description" content="Spin the planet, zoom into a region and read the latest news published about it." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="stars"></div>
+    <main id="stage">
+      <div id="globe"></div>
+      <div id="reticle" aria-hidden="true"><span></span></div>
+    </main>
+
+    <header id="hud">
+      <div class="brand">NEWS<span>GLOBE</span></div>
+      <div class="tag">orbital news scanner</div>
+      <div id="telemetry" class="mono">LAT 0.00 · LNG 0.00 · ALT 2.50</div>
+      <form id="search" autocomplete="off">
+        <input id="search-input" list="country-list" placeholder="Jump to country…" aria-label="Jump to country" />
+        <datalist id="country-list"></datalist>
+      </form>
+    </header>
+
+    <aside id="panel" aria-live="polite">
+      <button id="panel-toggle" aria-label="Toggle news panel">▾</button>
+      <div class="panel-head">
+        <div class="eyebrow mono" id="target-kind">NO TARGET</div>
+        <h1 id="target-name">Zoom in on a region</h1>
+        <div class="status mono" id="status">Scroll or pinch to zoom · click a country to fly there</div>
+      </div>
+
+      <div class="filters">
+        <div id="topics" class="chips" role="group" aria-label="Topics"></div>
+        <div class="row">
+          <label>Window
+            <select id="timespan">
+              <option value="24h">24 hours</option>
+              <option value="3d">3 days</option>
+              <option value="1w" selected>7 days</option>
+              <option value="1m">30 days</option>
+            </select>
+          </label>
+          <label>Sort
+            <select id="sort">
+              <option value="datedesc">Newest</option>
+              <option value="hybridrel">Relevance</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="english" checked /> English only</label>
+          <label id="source-wrap" hidden>Source
+            <select id="source">
+              <option value="gdelt">GDELT</option>
+              <option value="guardian">Guardian</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <ol id="articles"></ol>
+      <footer class="mono credit">Data: <a href="https://www.gdeltproject.org/" target="_blank" rel="noopener">GDELT Project</a> · geo: Natural Earth, BigDataCloud</footer>
+    </aside>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
